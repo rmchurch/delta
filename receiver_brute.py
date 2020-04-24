@@ -3,6 +3,7 @@
 # this code requires the modified fluctana code, https://github.com/rmchurch/fluctana.git
 
 import numpy as np 
+import math
 import adios2
 import json
 import argparse
@@ -11,8 +12,9 @@ import concurrent.futures
 import time
 import os
 import socket
-import queue
-import threading
+#import queue
+#import threading
+import trio
 
 import sys
 from fluctana import *
@@ -189,64 +191,86 @@ def dispatch():
         future = executor.submit(perform_analysis, channel_data, cfg, tstep, trange)
         dq.task_done()
 
+async def consumer(receive_channel):
+    async with receive_channel:
+        async for (channel_data, cfg, tstep, trange) in receive_channel:
+            logging.info(f"\tDispatcher: read data: tstep = {tstep}, rank = {rank}")
+            if channel_data is None:
+                break
+            future = executor.submit(perform_analysis, channel_data, cfg, tstep, trange)
+
 # Main
-if __name__ == "__main__":
-    with MPICommExecutor(comm, root=0) as executor:
-        if executor is not None:
-            # Only master will execute the following block
-            # Use of "__main__" is critical
+async def producer(send_channel):
+    #RMC Not sure if order of "withs" matter here or not
+    async with send_channel:
+        with MPICommExecutor(comm, root=0) as executor:
+            if executor is not None:
+                # Only master will execute the following block
+                # Use of "__main__" is critical
 
-            # The master thread will keep reading data, while 
-            # a helper thread (dispatcher) will dispatch jobs in the queue (dq) asynchronously 
-            # and distribute jobs to other workers.
-            # The main idea is not to slow down the master.
-            dq = queue.Queue()
-            dispatcher = threading.Thread(target=dispatch)
-            dispatcher.start()
+                # The master thread will keep reading data, while 
+                # a helper thread (dispatcher) will dispatch jobs in the queue (dq) asynchronously 
+                # and distribute jobs to other workers.
+                # The main idea is not to slow down the master.
+                # dq = queue.Queue()
+                # dispatcher = threading.Thread(target=dispatch)
+                # dispatcher.start()
 
-            # Only the master thread will open a data stream.
-            # General reader: engine type and params can be changed with the config file
-            if not args.debug:
-                reader = reader_gen(cfg["shotnr"], 0, cfg["engine"], cfg["params"])
-                reader.Open()
-            else:
-                reader.get_all_data()
-
-            # Main loop is here
-            # Reading data (from KSTAR) and save in the queue (dq) as soon as possible.
-            # Dispatcher (a helper thread) will asynchronously fetch data in the queue and distribute to other workers.
-            cfg_update = False
-            logging.info(f"Start data reading loop")
-            tstart = time.time()
-            while(True):
-                stepStatus = reader.BeginStep()
-                if stepStatus == adios2.StepStatus.OK:
-                    currentStep = reader.CurrentStep()
-                    logging.info(f"Step {currentStep} started")
-                    trange = list(reader.get_data("trange"))
-                    channel_data = reader.get_data("floats")
-                    if not cfg_update:
-                        cfg.update(reader.get_attrs("cfg"))
-                        cfg_update = True
-                    reader.EndStep()
+                # Only the master thread will open a data stream.
+                # General reader: engine type and params can be changed with the config file
+                if not args.debug:
+                    reader = reader_gen(cfg["shotnr"], 0, cfg["engine"], cfg["params"])
+                    reader.Open()
                 else:
-                    logging.info(f"Receiver: end of stream, rank = {rank}")
-                    break
+                    reader.get_all_data()
 
-                # Recover channel data 
-                #TODO: Does the generator.py have to send data over like this?
-                # channel_data = channel_data.reshape((num_channels, channel_data.size // num_channels))
-                logging.info(f"Receiver: received data tstep={currentStep}, rank = {rank}")
+                # Main loop is here
+                # Reading data (from KSTAR) and save in the queue (dq) as soon as possible.
+                # Dispatcher (a helper thread) will asynchronously fetch data in the queue and distribute to other workers.
+                cfg_update = False
+                logging.info(f"Start data reading loop")
+                tstart = time.time()
+                while(True):
+                    stepStatus = reader.BeginStep()
+                    if stepStatus == adios2.StepStatus.OK:
+                        currentStep = reader.CurrentStep()
+                        logging.info(f"Step {currentStep} started")
+                        trange = list(reader.get_data("trange"))
+                        channel_data = reader.get_data("floats")
+                        if not cfg_update:
+                            cfg.update(reader.get_attrs("cfg"))
+                            cfg_update = True
+                        reader.EndStep()
+                    else:
+                        logging.info(f"Receiver: end of stream, rank = {rank}")
+                        break
 
-                # Save data in a queue then go back to work
-                # Dispatcher (a helper thread) will fetch asynchronously.
-                dq.put((channel_data, cfg, currentStep, trange))
-            logging.info(f"All data read and dispatched, time elapsed: {time.time()-tstart}")
-            
-            ## Clean up
-            dq.join()
-            dq.put((None, None, -1, -1))
-            dispatcher.join()
-    if rank==0: logging.info(f"Receiver: done")
+                    # Recover channel data 
+                    #TODO: Does the generator.py have to send data over like this?
+                    # channel_data = channel_data.reshape((num_channels, channel_data.size // num_channels))
+                    logging.info(f"Receiver: received data tstep={currentStep}, rank = {rank}")
 
-# End of file processor_adios2.
+                    # Save data in a queue then go back to work
+                    # Dispatcher (a helper thread) will fetch asynchronously.
+                    await send_channel.send((channel_data, cfg, currentStep, trange))
+                    #dq.put((channel_data, cfg, currentStep, trange))
+                logging.info(f"All data read and dispatched, time elapsed: {time.time()-tstart}")
+                
+                ## Clean up
+                # dq.join()
+                # dq.put((None, None, -1, -1))
+                # dispatcher.join()
+        if rank==0: logging.info(f"Receiver: done")
+
+
+async def main():
+    async with trio.open_nursery() as nursery:
+        #create memory channel that acts as Queue (but thread-safe, not blocking)
+        #set  max buffer size to math.inf, ensure all data chunks put into "queue"
+        send_channel, receive_channel = trio.open_memory_channel(math.inf)
+        nursery.start_soon(producer, send_channel)
+        nursery.start_soon(consumer, receive_channel)
+
+
+if __name__ == "__main__":
+    trio.run(main)
