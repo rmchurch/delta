@@ -55,49 +55,45 @@ with open(args.config, "r") as df:
 
 
 #TODO: Remove for non-debug
-if args.debug:
-    class read_stream(object):
-        def __init__(self,shot,nchunk,data_path='./'):
-            self.dobj = KstarEcei(shot=shot,data_path=data_path,clist=['ECEI_L0101-2408'],verbose=False)
-            self.time = self.dobj.time_base_full()
-            tstarts = self.time[::nchunk]
-            tstops = self.time[nchunk-1::nchunk]
-            if tstarts.size>tstops.size: tstarts = tstarts[:-1]
-            self.timeiter = iter(zip(tstarts,tstops))
-            self.current_step = 0
+class read_stream(object):
+    def __init__(self,shot,nchunk,cfg={},data_path='./'):
+        self.dobj = KstarEcei(shot=shot,data_path=data_path,clist=['ECEI_L0101-2408'],verbose=False)
+        self.time = self.dobj.time_base_full()
+        tstarts = self.time[::nchunk]
+        tstops = self.time[nchunk-1::nchunk]
+        if tstarts.size>tstops.size: tstarts = tstarts[:-1]
+        self.timeiter = iter(zip(tstarts,tstops))
+        self.current_step = 0
+        self.cfg_extra = cfg
 
-        def get_all_data(self):
-            _,data = self.dobj.get_data(trange=[self.time[0],self.time[-1]],norm=1,verbose=0)
-            n = int(np.ceil(data.shape[-1]/nchunk))
-            self.dataSplit = np.array_split(data,n,axis=-1)
+    def get_all_data(self):
+        _,data = self.dobj.get_data(trange=[self.time[0],self.time[-1]],norm=1,verbose=0)
+        n = int(np.ceil(data.shape[-1]/nchunk))
+        self.dataSplit = np.array_split(data,n,axis=-1)
 
-        def get_data(self,type_str):
-            if 'trange' in type_str:
-                trange = next(self.timeiter)
-            else:
-                #_,data = self.dobj.get_data(trange=trange,norm=1,verbose=0)
-                data = self.dataSplit[self.current_step]
-                self.current_step += 1
-                return data
+    def get_data(self,type_str):
+        if 'trange' in type_str:
+            trange = next(self.timeiter)
+            return trange
+        else:
+            #_,data = self.dobj.get_data(trange=trange,norm=1,verbose=0)
+            data = self.dataSplit[self.current_step]
+            self.current_step += 1
+            return data
 
-        def BeginStep(self):
-            if (self.current_step<len(self.dataSplit)):
-                return adios2.stepStatus.OK
+    def get_attrs(self,type_str):
+        return self.cfg_extra
 
-        def CurrentStep(self):
-            return self.current_step
+    def BeginStep(self):
+        if (self.current_step<len(self.dataSplit)):
+            return adios2.StepStatus.OK
 
-        def EndStep(self):
-            pass
+    def CurrentStep(self):
+        return self.current_step
 
+    def EndStep(self):
+        pass
 
-    shot = 18431; nchunk=10000
-    reader = read_stream(shot=shot,nchunk=nchunk,data_path=cfg["datapath"])
-    #merge into cfg dict
-    cfg.update({'shot':shot,'nfft':1000,'window':'hann','overlap':0.0,'detrend':1, 
-            'TriggerTime':reader.dobj.tt,'SampleRate':[reader.dobj.fs/1e3], 
-            'TFcurrent':reader.dobj.itf/1e3,'Mode':reader.dobj.mode, 
-            'LoFreq':reader.dobj.lo,'LensFocus':reader.dobj.sf,'LensZoom':reader.dobj.sz})
 
 def save_spec(results,tstep):
     #TODO: Determine how to use adios2 efficiently instead (and how to read in like normal, e.g. without steps?)
@@ -193,7 +189,7 @@ def dispatch():
 
 async def consumer(receive_channel):
     async with receive_channel:
-        async for (channel_data, cfg, tstep, trange) in receive_channel:
+        async for (executor,channel_data, cfg, tstep, trange) in receive_channel:
             logging.info(f"\tDispatcher: read data: tstep = {tstep}, rank = {rank}")
             if channel_data is None:
                 break
@@ -219,7 +215,6 @@ async def producer(send_channel):
                 # Only the master thread will open a data stream.
                 # General reader: engine type and params can be changed with the config file
                 if not args.debug:
-                    reader = reader_gen(cfg["shotnr"], 0, cfg["engine"], cfg["params"])
                     reader.Open()
                 else:
                     reader.get_all_data()
@@ -252,7 +247,7 @@ async def producer(send_channel):
 
                     # Save data in a queue then go back to work
                     # Dispatcher (a helper thread) will fetch asynchronously.
-                    await send_channel.send((channel_data, cfg, currentStep, trange))
+                    await send_channel.send((executor,channel_data, cfg, currentStep, trange))
                     #dq.put((channel_data, cfg, currentStep, trange))
                 logging.info(f"All data read and dispatched, time elapsed: {time.time()-tstart}")
                 
@@ -273,4 +268,17 @@ async def main():
 
 
 if __name__ == "__main__":
+
+    if args.debug:
+        shot = 18431; nchunk=10000
+        #merge into cfg dict
+        reader = read_stream(shot=shot,nchunk=nchunk,data_path=cfg["datapath"])
+        reader.cfg_extra = {'shot':shot,'nfft':1000,'window':'hann','overlap':0.0,'detrend':1, 
+                'TriggerTime':reader.dobj.tt,'SampleRate':[reader.dobj.fs/1e3], 
+                'TFcurrent':reader.dobj.itf/1e3,'Mode':reader.dobj.mode, 
+                'LoFreq':reader.dobj.lo,'LensFocus':reader.dobj.sf,'LensZoom':reader.dobj.sz}
+
+    else:
+        reader = reader_gen(cfg["shotnr"], 0, cfg["engine"], cfg["params"])
+ 
     trio.run(main)
