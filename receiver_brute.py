@@ -116,66 +116,68 @@ def perform_analysis(channel_data, cfg, tstep, trange):
     Perform analysis
     """ 
     logging.info(f"\tWorker: do analysis: tstep = {tstep}, rank = {rank}")
-    t0 = time.time()
-    if(cfg["analysis"][0]["name"] == "all"):
-        results = {} 
-        dobjAll = KstarEcei(shot=cfg["shotnr"],cfg=cfg,clist=cfg["channel_range"],verbose=False)
-        if len(A.Dlist)==0: 
-            A.Dlist.append(dobjAll)
-        else:
-            A.Dlist[0] = dobjAll
-        A.Dlist[0].data = channel_data
-        A.Dlist[0].time,_,_,_,_ = A.Dlist[0].time_base(trange)
-        #this could be done on rank==0 as Ralph imagined
-        A.fftbins(nfft=cfg['fft_params']['nfft'],window=cfg['fft_params']['window'],
-          overlap=cfg['fft_params']['overlap'],detrend=cfg['fft_params']['detrend'],full=1,scipy=True)
-        results['stft'] = A.Dlist[0].spdata
+    try:
+        t0 = time.time()
+        if(cfg["analysis"][0]["name"] == "all"):
+            results = {} 
+            dobjAll = KstarEcei(shot=cfg["shotnr"],cfg=cfg,clist=cfg["channel_range"],verbose=False)
+            if len(A.Dlist)==0: 
+                A.Dlist.append(dobjAll)
+            else:
+                A.Dlist[0] = dobjAll
+            A.Dlist[0].data = channel_data
+            A.Dlist[0].time,_,_,_,_ = A.Dlist[0].time_base(trange)
+            #this could be done on rank==0 as Ralph imagined
+            A.fftbins(nfft=cfg['fft_params']['nfft'],window=cfg['fft_params']['window'],
+              overlap=cfg['fft_params']['overlap'],detrend=cfg['fft_params']['detrend'],full=1,scipy=True)
+            results['stft'] = A.Dlist[0].spdata
 
-        Nchannels = channel_data.shape[0] 
-        for ic in range(Nchannels):
-            logging.info(f"\tWorker: do analysis: tstep={tstep}, rank={rank}, analysis={ic}, hostname={hostname}")
-            chstr = A.Dlist[0].clist[ic]
-            done_subset = [ic]
-            dtwo_subset = range(done_subset[0],Nchannels)
-            #TODO: Decide on cwt, need to remove autoplot
-            #1 cwt
-            #A.cwt()
-            #save_spec(A)
-            #2 cross_power
-            A.cross_power(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset)
-            results['cross_power/'+chstr] = A.Dlist[0].val
-            #3 coherence
-            A.coherence(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset)
-            results['coherence/'+chstr] = A.Dlist[0].val
-            #4 cross-phase
-            A.cross_phase(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset)
-            results['cross_phase/'+chstr] = A.Dlist[0].val
-            #5 correlation
-            A.correlation(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset)
-            results['correlation/'+chstr] = A.Dlist[0].val
-            #6 corr_coef
-            A.corr_coef(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset)
-            results['corr_coef/'+chstr] = A.Dlist[0].val
-            #7 xspec
-            #TODO xspec has rnum=cnum, so have to do one at a time, decide best way
-            #A.xspec(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset, plot=False)
-            #save_spec(A)
-            #8 skw
-            #TODO: not same ref/cmp channel setup, check
-            #A.skw(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset, plot=False)
-            #save_spec(A)
-            #9 bicoherence
-            #A.bicoherence(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset, plot=False)
-            #results['bicoherence/'+chstr] = A.Dlist[0].val
-            t1 = time.time()
-            # Store result in database
-            # backend.store(my_analysis, analysis_result)
-            logging.info(f"\tWorker: done with analysis: tstep={tstep}, rank={rank}, analysis={ic}, hostname={hostname}")
-        logging.info(f"Worker: loop done: tstep={tstep}, rank={rank}, hostname={hostname}")
-        save_spec(results,tstep)
-        logging.info(f"perform_analysis done: tstep={tstep}, rank={rank}, hostname={hostname}")
-
-# Function for a helper thead (dispatcher).
+            Nchannels = channel_data.shape[0] 
+            for ic in range(Nchannels):
+                logging.info(f"\tWorker: do analysis: tstep={tstep}, rank={rank}, analysis={ic}, hostname={hostname}")
+                chstr = A.Dlist[0].clist[ic]
+                done_subset = [ic]
+                dtwo_subset = range(done_subset[0],Nchannels)
+                #TODO: Decide on cwt, need to remove autoplot
+                #1 cwt
+                #A.cwt()
+                #save_spec(A)
+                #2 cross_power
+                A.cross_power(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset)
+                results['cross_power/'+chstr] = A.Dlist[0].val
+                #3 coherence
+                A.coherence(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset)
+                results['coherence/'+chstr] = A.Dlist[0].val
+                #4 cross-phase
+                A.cross_phase(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset)
+                results['cross_phase/'+chstr] = A.Dlist[0].val
+                #5 correlation
+                A.correlation(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset)
+                results['correlation/'+chstr] = A.Dlist[0].val
+                #6 corr_coef
+                A.corr_coef(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset)
+                results['corr_coef/'+chstr] = A.Dlist[0].val
+                #7 xspec
+                #TODO xspec has rnum=cnum, so have to do one at a time, decide best way
+                #A.xspec(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset, plot=False)
+                #save_spec(A)
+                #8 skw
+                #TODO: not same ref/cmp channel setup, check
+                #A.skw(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset, plot=False)
+                #save_spec(A)
+                #9 bicoherence
+                #A.bicoherence(done=0,dtwo=0, done_subset=done_subset, dtwo_subset=dtwo_subset, plot=False)
+                #results['bicoherence/'+chstr] = A.Dlist[0].val
+                t1 = time.time()
+                # Store result in database
+                # backend.store(my_analysis, analysis_result)
+                logging.info(f"\tWorker: done with analysis: tstep={tstep}, rank={rank}, analysis={ic}, hostname={hostname}")
+            logging.info(f"Worker: loop done: tstep={tstep}, rank={rank}, hostname={hostname}")
+            save_spec(results,tstep)
+            logging.info(f"perform_analysis done: tstep={tstep}, rank={rank}, hostname={hostname}")
+    except:
+        logging.exception(f"ERROR: Worker: tstep={tstep}, rank={rank}, hostname={hostname}")
+    # Function for a helper thead (dispatcher).
 # The dispatcher will dispatch data in the queue (dq) and 
 # distribute to other workers (non-master MPI workers) with mpi4py's MPICommExecutor.
 def dispatch():
@@ -274,6 +276,7 @@ if __name__ == "__main__":
         #merge into cfg dict
         reader = read_stream(shot=shot,nchunk=nchunk,data_path=cfg["datapath"])
         reader.cfg_extra = {'shot':shot,'nfft':1000,'window':'hann','overlap':0.0,'detrend':1, 
+                'channel_range': ["ECEI_L0101-2408"],
                 'TriggerTime':reader.dobj.tt,'SampleRate':[reader.dobj.fs/1e3], 
                 'TFcurrent':reader.dobj.itf/1e3,'Mode':reader.dobj.mode, 
                 'LoFreq':reader.dobj.lo,'LensFocus':reader.dobj.sf,'LensZoom':reader.dobj.sz}
