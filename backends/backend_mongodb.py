@@ -1,13 +1,18 @@
 #Coding: UTF-8 -*-
 
+from mpi4py import MPI
 import datetime
 import numpy as np
+import adios2
 import pickle
 import string
 import random
 import logging
 import json
 import uuid
+import time
+import traceback
+
 
 import pymongo 
 import gridfs
@@ -17,52 +22,141 @@ from os.path import isdir, join
 
 from .backend import backend, serialize_dispatch_seq
 
+class mongo_connection():
+    """Abstraction for mongo_connection using context manager"""
+
+    def __init__(self, cfg_mongo):
+        # Parse connection info
+
+        self.conn_info = {}
+        with open("mongo_secret", "r") as secret:
+            lines = secret.readlines()
+            self.conn_info["username"] = lines[0].strip()
+            self.conn_info["password"] = lines[1].strip()
+            self.conn_info["conn_str"] = lines[2].strip()
+
+        # Parse location for binary data storage
+        assert cfg_mongo["datastore"] in ["gridfs", "numpy", "adios2"]
+        self.datastore = cfg_mongo["datastore"]
+
+        # Get name of the run
+        assert(len(cfg_mongo["run_id"]) == 6)
+        self.coll_str = "test_analysis_" + cfg_mongo["run_id"]
+
+    def __enter__(self):
+        """Instantiate a new MongoClient and return the collection"""
+        self.client = pymongo.MongoClient(self.conn_info["conn_str"], username=self.conn_info["username"],
+                                          password=self.conn_info["password"])
+
+        db = self.client.get_database() 
+        try:
+            collection = db.get_collection(self.coll_str)
+        except:
+            self.logger.error(f"Could not access collection {self.coll_str}")
+
+        return (self.client, collection)
+
+    def __exit__(self, exc_type, exc_value, tb):
+        """Close connection to MongoDB"""
+        if exc_type is not None:
+            traceback.print_exception(exc_type, exc_value, tb)
+            # return False # uncomment to pass exception through
+
+            return True 
+
+        self.db = None
+        self.client.close()
+
+        return True
+
+
+
+class mongo_storage_numpy():
+    """Abstraction for numpy storage using context manager used by backend_mongodb"""
+    def __init__(self, cfg_mongo):
+        self.datadir = join(cfg_mongo["datadir"], cfg_mongo["run_id"])
+        if (isdir(self.datadir) == False):
+            try:
+                mkdir(self.datadir)
+            except:
+                self.logger.error(f"Could not access path {self.datadir}")
+                raise ValueError(f"Could not access path {self.datadir}")
+
+    def __enter__(self):
+        fname = join(self.datadir, uuid.uuid1().__str__() + ".npz")
+        return fname
+
+    def __exit__(self, exc_type, exc_value, tb):
+        if exc_type is not None:
+            traceback.print_exception(exc_type, exc_value, tb)
+            return True
+
+        return True
+
+
+class mongo_storage_gridfs():
+    """Abstraction for gridfs storage using context manager used by backend_mongodb"""
+    def __init__(self, db):
+        self.db = db
+
+
+    def __enter__(self):
+        fs = gridfs.GridFS(self.db)
+        return fs
+
+
+    def __exit__(self, exc_type, exc_value, tb):
+        if exc_type is not None:
+            traceback.print_exception(exc_type, exc_value, tb)
+            return True
+
+        return True
+
+
+class mongo_storage_adios2():
+    """Abstraction for gridfs storage using context manager used by backend_mongodb"""
+    def __init__(self, cfg_mongo):
+        self.datadir = join(cfg_mongo["datadir"], cfg_mongo["run_id"])
+        if (isdir(self.datadir) == False):
+            try:
+                mkdir(self.datadir)
+            except:
+                self.logger.error(f"Could not access path {self.datadir}")
+                raise ValueError(f"Could not access path {self.datadir}")
+
+    def __enter__(self):
+        fname = join(self.datadir, uuid.uuid1().__str__() + ".bp")
+        return fname
+
+    def __exit__(self, exc_type, exc_value, tb):
+        if exc_type is not None:
+            traceback.print_exception(exc_type, exc_value, tb)
+            return True
+
+        return True        
+
 
 class backend_mongodb(backend):
     """
     Author: Ralph Kube
 
-    Defines the MongoDB storage backend.
+    Defines the MongoDB storage backend. Note that PyMongo is not fork-safe.
+    A new MongoClient needs to be instantiated each time store_data is executed on a PoolExecutor
+    See
+    https://api.mongodb.com/python/current/faq.html#id21
+
+    __init__ is an adaptor pattern that parses the config file and mongo_secret.
+    connect() is to be used internally and returns the connection to the database.
     """
     def __init__(self, cfg_mongo):
         """Connect to MongoDB and, if necessary, initializes gridFS."""
         # Connect to mongodb
+        self.logger = logging.getLogger("DB")
+        self.cfg_mongo = cfg_mongo
 
-        with open("mongo_secret", "r") as secret:
-            lines = secret.readlines()
-            username = lines[0].strip()
-            password = lines[1].strip()
-            connection_str = lines[2].strip()
-
-        self.client = pymongo.MongoClient(connection_str, 
-                                          username=username,
-                                          password=password)
-
-        db = self.client.get_database()
-        self.datadir = join(cfg_mongo["storage"]["datadir"], cfg_mongo["run_id"])
-
-        # Analysis data is either stored in gridFS(slow!) or numpy.
-        assert cfg_mongo["storage"]["datastore"] in ["gridfs", "numpy"]
-
-        if cfg_mongo["storage"]["datastore"] == "numpy":
-            # Initialize storage directory
-            if (isdir(self.datadir) == False):
-                try:
-                    mkdir(self.datadir)
-                except:
-                    raise ValueError(f"Could not access path {self.datadir}")
-            self.fs = None
-
-        elif cfg_mongo["storage"]["datastore"] == "gridfs":
-            # Initialize gridFS
-            self.fs = gridfs.GridFS(db)       
-        
-        try:
-            self.collection = db.get_collection("test_analysis_" + cfg_mongo['run_id'])
-        except:
-            print("Could not get a collection")
-
-            
+        # Parse location for binary data storage
+        assert cfg_mongo["datastore"] in ["gridfs", "numpy", "adios2"]
+        self.datastore = cfg_mongo["datastore"]
 
     def store_metadata(self, cfg, dispatch_seq):
         """Stores metadata that allows to identify channel pairs with the stored data.
@@ -73,9 +167,6 @@ class backend_mongodb(backend):
         dispatch_seq: The serialized task dispatch sequence
         """
 
-        logger = logging.getLogger("DB")
-        logger.debug("backend_mongodb: entering store_metadata")
-
         j_str = serialize_dispatch_seq(dispatch_seq)
         # Put the channel serialization in the corresponding key
         j_str = '{"channel_serialization": ' + j_str + '}'
@@ -83,55 +174,19 @@ class backend_mongodb(backend):
         # Adds the channel_serialization key to cfg
         cfg.update(j)
         cfg.update({"timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%d %X UTC")})
-    
         cfg.update({"description": "metadata"})
 
-        try:
-            result = self.collection.insert_one(cfg)
-        except pymongo.errors.PyMongoError as e:
-            logger.error("An error has occurred in store_metadata:: ", e)
+        with mongo_connection(self.cfg_mongo) as mongo:
+            client, coll = mongo
+            try:
+                result = coll.insert_one(cfg)
+            except pymongo.errors.PyMongoError as e:
+               self.logger.error(f"An error has occurred in store_metadata:: {e}")
 
         return result.inserted_id
 
 
-    def store_task(self, task, future=None, dummy=True):
-        """Stores results from analysis tasks in the database.
-
-        The results from analysis_task futures are evaluated in this method.
-
-        Parameters
-        ----------
-        task: analysis_task object. 
-        dummy: bool. If true, do not insert the item into the database
-        
-        Returns
-        -------
-        None
-        """
-
-        # Gather the results from all futures in the task
-        # This locks until all futures are evaluated.
-        result = []
-        for future in task.futures_list:
-            result.append(future.result())
-        result = np.array(result)
-
-        # Write results to the backend
-        storage_scheme = task.storage_scheme
-        # Add a time stamp to the scheme
-        storage_scheme["time"] =  datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        if dummy:
-            storage_scheme["results"] = result
-            print(storage_scheme)
-        else:
-            storage_scheme["results"] = Binary(pickle.dumps(result))
-            self.collection.insert_one(storage_scheme)
-
-        return None
-
-
-    def store_data(self, data, info_dict, cfg):
+    def store_data(self, data, info_dict):
         """Stores arbitrary data in mongodb
 
         Parameters
@@ -141,33 +196,68 @@ class backend_mongodb(backend):
         cfg: delta configuration object
         """
 
-        if cfg["storage"]["datastore"] == "gridfs":
-            # Create a binary object and store it in gridfs
-            fid = self.fs.put(Binary(pickle.dumps(data)))
-            info_dict.update({"result_gridfs": fid})
-        
-        elif cfg["storage"]["datastore"] == "numpy":
-            # Create a unique file-name
-            unq_fname = uuid.uuid1()
-            unq_fname = unq_fname.__str__() + ".npz"
-            np.savez(join(self.datadir, unq_fname), data=data)
-            info_dict.update({"unique_filename": unq_fname})
+        size_in_MB = np.prod(data.shape) * data.dtype.itemsize / 1024 / 1024
 
-        info_dict.update({"timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")})
-        info_dict.update({"description": "analysis results"})
+        with mongo_connection(self.cfg_mongo) as mongo:
+            client, coll = mongo
+            if self.datastore == "gridfs":
+                with mongo_storage_gridfs(client.get_database()) as fs:
+                    tmp = Binary(pickle.dumps(data))
+                    tic_io = time.perf_counter()
+                    fid = fs.put(tmp)
+                    toc_io = time.perf_counter()
+                    info_dict.update({"result_gridfs": fid})
 
-        try:
-            inserted_id = self.collection.insert_one(info_dict)
+            elif self.datastore == "numpy":
+                with mongo_storage_numpy(self.cfg_mongo) as fname:
+                    tic_io = time.perf_counter()
+                    np.savez(fname, data=data)
+                    toc_io = time.perf_counter()
+                    info_dict.update({"unique_filename": fname})
 
-        except:
-            print("Unexpected error:", sys.exc_info()[0])
-            raise
+            elif self.datastore == "adios2":
+                # Use adios2's context manager
+                datadir = join(self.cfg_mongo["datadir"], self.cfg_mongo["run_id"])
+                if (isdir(datadir) == False):
+                    try:
+                        mkdir(datadir)
+                    except:
+                        self.logger.error(f"Could not access path {datadir}")
+                        raise ValueError(f"Could not access path {datadir}")
 
+                fname = join(datadir, uuid.uuid1().__str__() + ".bp")
+                info_dict.update({"unique_filename": fname})
+
+                # with open(fname, "w") as df:
+                    # tic_io = time.perf_counter()
+                    # df.write(info_dict["analysis_name"])
+                with adios2.open(fname, "w") as fh:
+                    tic_io = time.perf_counter()
+                    fh.write(info_dict["analysis_name"], data, data.shape, [0] * data.ndim, data.shape)
+                    toc_io = time.perf_counter()
+                    
+
+            # Calculate performance metric
+            MB_per_sec = size_in_MB / (toc_io - tic_io)
+            info_dict.update({"Performance": MB_per_sec})
+
+            info_dict.update({"timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")})
+            info_dict.update({"description": "analysis results"})
+
+            try:
+                inserted_id = coll.insert_one(info_dict)
+            except:
+                self.logger.error("Unexpected error:", sys.exc_info()[0])
+
+            return None
 
     def store_one(self, item):
         """Wrapper to store an item"""
+        with mongo_connection(self.cfg_mongo) as mongo:
+            client, coll = mongo
+            coll.insert_one(item)
 
-        self.collection.insert_one(item)
+        return None
 
 
 # End of file mongodb.py

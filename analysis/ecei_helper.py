@@ -1,7 +1,7 @@
 #Encoding: UTF-8 -*-
 
 """
-Author: Ralph Kube
+Author: Minjun Choi (original), Ralph Kube
 
 Contains helper function for working with the ECEI diagnostic.
 These are just the member functions from kstarecei.py, copied here
@@ -174,8 +174,10 @@ def beam_path(ch, LensFocus, LensZoom, rpos):
 
     # vertical posistion and angle at rpos
     za = np.dot(abcd, [zz, aa])
-    zpos = za[0][ch.ch_h - 1] * 1e-3  # zpos [m]
-    apos = za[1][ch.ch_h - 1]  # angle [rad] positive means the (z+) up-directed (divering from array to plasma)
+    zpos = za[0][ch.ch_v - 1] * 1e-3  # zpos [m]
+    apos = za[1][ch.ch_v - 1]  # angle [rad] positive means the (z+) up-directed (divering from array to plasma)
+
+    print(f"   LensFocus={LensFocus} LensZoom={LensZoom} rpos={rpos:5.3f} abcd={abcd}")
 
     return zpos, apos
 
@@ -183,15 +185,15 @@ def channel_position(ch, ecei_cfg):
     """Calculates the position of a channel in configuration space
 
     Input:
-    ======1
+    ======
     ch, channel, The channel whos position we want to calculate
     ecei_cfg, dict: Parameters of the ECEi diagnostic.
     """
     
-    me = 9.1e-31            # electron mass, in kg
-    e = 1.602e-19           # charge, in C
-    mu0 = 4 * np.pi * 1e-7  # permeability
-    ttn = 56*16             # total TF coil turns
+    me = 9.1e-31             # electron mass, in kg
+    e = 1.602e-19            # charge, in C
+    mu0 = 4. * np.pi * 1e-7  # permeability
+    ttn = 56*16              # total TF coil turns
 
     # Unpack ecei_cfg
     TFcurrent = ecei_cfg["TFcurrent"] # Instead of multiplying by 1e3, we put this in the config file
@@ -209,28 +211,15 @@ def channel_position(ch, ecei_cfg):
         print("ecei_cfg: key {0:s} not found. Defaulting to 2nd X-mode".format(k.__str__()))
         ecei_cfg["Mode"] = 'X'
         hn = 2
+    
+    print(f"channel_position: ch_v={ch.ch_v}, ch_h={ch.ch_h}")
 
     rpos = hn * e * mu0 * ttn * TFcurrent /\
-                (4. * np.pi * np.pi * me * ((ch.ch_v - 1) * 0.9 + 2.6 + LoFreq) * 1e9)
+                (4. * np.pi * np.pi * me * ((ch.ch_h - 1) * 0.9 + 2.6 + LoFreq) * 1e9)
+    
     zpos, apos = beam_path(ch, LensFocus, LensZoom, rpos)
-
+    print(f"       rpos={rpos:5.3f}, zpos={zpos:5.3f}, apos={apos:5.3f}")
     return (rpos, zpos, apos)
-
-
-    #cnum = len(self.clist)
-    #self.rpos = np.zeros(cnum)  # R [m] of each channel
-    #self.zpos = np.zeros(cnum)  # z [m] of each channel
-    #self.apos = np.zeros(cnum)  # angle [rad] of each channel
-    #for c in range(0, cnum):
-    #    print(self.clist[c], self.cnidx1)
-    #    vn = int(self.clist[c][(self.cnidx1):(self.cnidx1+2)])
-    #    fn = int(self.clist[c][(self.cnidx1+2):(self.cnidx1+4)])
-
-    #    # assume cold resonance with Bt ~ 1/R
-    #    self.rpos[c] = self.hn*e*mu0*ttn*self.itf/((2*np.pi)**2*me*((fn - 1)*0.9 + 2.6 + self.lo)*1e9)
-
-    #    # get vertical position and angle at rpos
-    #    self.zpos[c], self.apos[c] = self.beam_path(self.rpos[c], vn)
 
 
 # End of file ecei_helper.py

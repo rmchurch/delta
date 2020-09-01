@@ -1,90 +1,103 @@
 # -*- coding: UTF-8 -*-
 
 from mpi4py import MPI
-import numpy as np
-import time
-import adios2
-
 from os import path
+import numpy as np
 
+import adios2
 import json
+import yaml
 import argparse
 
-from generators.writers import writer_dataman, writer_bpfile, writer_sst, writer_gen
-from generators.data_loader import data_loader
+import timeit
+import time
+
+import logging, logging.config
+
+from analysis.channels import channel_range
+from streaming.writers import writer_gen
+from sources.loader_ecei_cached import loader_ecei
 
 """
-Generates batches of ECEI data.
+Distributes time-chunked ECEI data via ADIOS2.
 """
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
 
-
 parser = argparse.ArgumentParser(description="Send KSTAR data using ADIOS2")
-parser.add_argument('--config', type=str, help='Lists the configuration file', default='config.json')
+parser.add_argument('--config', type=str, help='Lists the configuration file', default='configs/test_generator.json')
 args = parser.parse_args()
 
 with open(args.config, "r") as df:
     cfg = json.load(df)
 
-datapath = cfg["datapath"]
+with open('configs/logger.yaml', 'r') as f:
+    log_cfg = yaml.safe_load(f.read())
+logging.config.dictConfig(log_cfg)
+
+logger = logging.getLogger("generator")
+
+datapath = cfg["transport_nersc"]["datapath"]
+nstep = cfg["transport_nersc"]["nstep"]
 shotnr = cfg["shotnr"]
-nstep = cfg["nstep"]
 
 # Enforce 1:1 mapping of channels and tasks
-assert(len(cfg["channel_range"]) == size)
+assert(len(cfg["transport_nersc"]["channel_range"]) == size)
 # Channels this process is reading
-my_channel_range = cfg["channel_range"][rank]
-gen_id = 100000 * rank + my_channel_range[0]
-
-print("Rank: {0:d}".format(rank), ", channel_range: ", my_channel_range, ", id = ", gen_id)
+ch_rg = channel_range.from_str(cfg["transport_nersc"]["channel_range"][rank])
 
 # Hard-code the total number of data points
-data_pts = int(5e6)
+#data_pts = int(5e6)
 # Hard-code number of data points per data packet
-data_per_batch = int(1e1)
+#data_per_batch = int(1e1)
 # Calculate the number of required data batches we send over the channel
-num_batches = data_pts // data_per_batch
+#num_batches = data_pts // data_per_batch
 
 # Get a data_loader
-dl = data_loader(path.join(datapath, "ECEI.018431.LFS.h5"),
-                 channel_range=my_channel_range,
-                 batch_size=cfg["batch_size"])
+logger.info("Loading h5 data into memory")
+dl = loader_ecei(cfg)
+dl.cache()
+batch_gen = dl.batch_generator()
 
-# Trying to load all h5 data into memory
-print("Loading h5 data into memory")
-data_all = list()
-for i in range(nstep):
-    # dl.get return a list of an array of uint16 data
-    # We convert as double
-    data_arr = np.array(dl.get()).astype(np.float64)
-    data_all.append(data_arr)
+logger.info(f"Creating writer_gen: shotnr={shotnr}, engine={cfg['transport_nersc']['engine']}")
 
-#writer = writer_dataman(shotnr, gen_id)
-writer = writer_gen(shotnr, gen_id, cfg["engine"], cfg["params"])
+writer = writer_gen(cfg["transport_nersc"])
 
-writer.DefineVariable(data_arr)
+# Pass data layout to writer and reset generator
+for data in batch_gen:
+    break
+writer.DefineVariable(ch_rg.to_str(), data)
+batch_gen = dl.batch_generator()
+
 writer.Open()
 
-print("Start sending:")
-t0 = time.time()
-for i in range(nstep):
+logger.info("Start sending on channel:")
+tic = timeit.default_timer()
+nstep = 0
+for data in batch_gen:
     if(rank == 0):
-        print("Sending: {0:d} / {1:d}".format(i, nstep))
-    writer.put_data(data_all[i])
-t1 = time.time()
+        logger.info(f"Sending time_chunk {nstep} / {dl.num_chunks}")
+    writer.BeginStep()
+    writer.put_data(data)
+    writer.EndStep()
+    nstep += 1
+    time.sleep(0.1)
 
-chunk_size = np.prod(data_arr.shape)*data_arr.itemsize/1024/1024
-print("")
-print("Summary:")
-print("    chunk shape:", data_arr.shape)
-print("    chunk size (MB): {0:.03f}".format(chunk_size))
-print("    total nstep:", nstep)
-print("    total data (MB): {0:.03f}".format(chunk_size*nstep))
-print("    time (sec): {0:.03f}".format(t1-t0))
-print("    throughput (MB/sec): {0:.03f}".format((chunk_size*nstep)/(t1-t0)))
+toc = timeit.default_timer()
+writer.writer.Close()
 
-print("Finished")
+chunk_size = np.prod(data.shape) * data.itemsize / 1024 / 1024
+logger.info("")
+logger.info("Summary:")
+logger.info(f"    chunk shape: {data.shape}")
+logger.info(f"    chunk size (MB): {chunk_size:.03f}")
+logger.info(f"    total nstep: {nstep:d}")
+logger.info(f"    total data (MB): {(chunk_size * nstep):03f}")
+logger.info(f"    time (sec): {(toc - tic):.03f}")
+logger.info(f"    throughput (MB/sec): {(chunk_size * nstep)/(toc - tic):.03f}")
 
+logger.info("Finished")
+
+# End of file generator.py

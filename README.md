@@ -25,6 +25,85 @@ Here is a diagram of the framework:
 
 # Implemented Workflows
 
+## Flexible workflow (2-node scenario)
+In this scenario, data is streamed from a DTN to Cori. The DTN executes generator.py, processor_mpi.py runs on Cori:
+
+```
+  generator.py        =======>     processor_mpi.py
+    (DTN)                |            (Cori)
+                         v
+          stream_name: SSSSS_NN.bp
+```
+The processor accesses distributed computing resources through a thread-pool, see PEP-3148. For Cori,
+mpi4py's MPICommExecutor is recommended. But other compatible executors should work as well.
+``processor_mpi.py`` implements this flexible workflow. It
+* Reads ECEI time chunks from an adios2 source
+* Puts the time chunks in a queue
+* A worker thread reads time chunks data from the queue, and passes it to Executor for analysis through task_ecei objects.
+* Calls the multi-threaded C/cython kernels for data processing
+
+This workflow allows for flexible channel sizes, so we call it the flexible workflow.
+
+Some spectral analysis are implemented as C kernels and interfaced via cython.
+To compile the C kernels
+```
+cd analysis/lib
+make
+```
+To build the cython interface
+```
+cd analysis
+CC=cc LDSHARED="cc -shared" python setup.py build_ext --inplace
+```
+
+Run this implementation on cori:
+```
+module unload PrgEnv-cray PrgEnv-gnu PrgEnv-intel
+module load PrgEnv-gnu
+module unload craype-hugepages2M
+module unload python
+module load python3
+module use -a /global/cscratch1/sd/jyc/sw/modulefiles
+module load adios2/devel
+module load python_delta_comm
+
+export OMP_NUM_THREAD=N
+srun -n 6 -c N python processor_mpi.py --config configs/test_all.json
+
+Alternatively, run the 2-node scenario using the task_list processor which uses an extra fft executor:
+srun -n 6 -c N python -m mpi4py.futures processor_mpi_tasklist.py --config configs/test_all.json
+```
+
+## Flexible workflow (3-node scenario)
+In this scenario, a middle-man forwards data from the DTN to Cori. This is necessary when the data stream
+needs to take another hop:
+
+```
+  generator.py   =======>     middle-man.py =====>  processor_mpi.py
+    (DTN)           |            (Hop)        |
+                    v                         v
+          stream_name: SSSSS_NN.bp          stream_name: SSSSS_NN.bp
+```
+
+## Setup
+
+
+
+
+
+
+
+
+# Configuration
+
+
+
+
+
+
+
+
+
 ## Workflow Scenario #1 (2-node scenario)
 In this scenario, data is streamed from a KSTAR Data Transfer Node (DTN) to a NERSC DTN:
 
@@ -58,7 +137,7 @@ Here is an example configuration file for the generator running on the KSTAR DTN
 }
 ```
 
-### Jongs reference implementation of the 2-node workflow
+### Reference implementation of the 2-node workflow
 This reference implmentation shows the feasability of streaming the data from KSTAR to NERSC with
 high velocity. To run this scenaris log in to the respective DTNS and execute:
 
@@ -69,23 +148,25 @@ python receiver.py --config config-jychoi.json
 
 Note that the processor is called receiver
 
-### MPI processor 
-This is the xyz=mpi case. 
-processor_mpi.py implements this case. This processor
-* Reads ECEI data from a bp file
-* Puts the data in a queue
-* A worker thread reads data from the queue and dispatches it to a MPI Executor for analysis
-* Calls the multi-threaded cython kernels for data processing
 
-Run this implemntation as
+Run the generator on the NERSC DTN as 
 ```
-export OMP_NUM_THREAD=N
-srun -n 6 -c N python -m mpi4py.futures processor_mpi.py --config configs/test_crossphase.json
+module use -a /global/cscratch1/sd/jyc/dtn/sw/spack/share/spack/modules/linux-centos7-ivybridge
+module load openmpi
+module load zeromq
+module load python py-numpy py-mpi4py py-h5py py-scipy py-matplotlib py-pyyaml
+module use -a /global/cscratch1/sd/jyc/dtn/sw/modulefiles
+module load adios2
+module load python_delta_comm
 ```
+
 
 For the KNL nodes, best performance is with N=8/16 and 24 or 48 MPI ranks.
 
 Data storage is implmented for numpy and mongodb backends. See the configuration files configs/test_all.json.
+The mongodb backend allows to store data either internally using gridFS or on the filesystem using numpy.
+Using mongodb with the numpy backend still stores all metadata in mongodb. 
+Using the pure numpy backend stores also the metadata in numpy files.
 
 
 ### MPI processor brute
@@ -106,7 +187,7 @@ module use -a /global/cscratch1/sd/jyc/dtn/sw/modulefiles
 
 module load openmpi
 module load zeromq adios2
-module load python py-numpy py-mpi4py py-h5py py-scipy py-matplotlib
+module load python py-numpy py-mpi4py py-h5py py-pyyaml py-scipy py-matplotlib
 
 mpirun -n 5 python -u -m mpi4py.futures receiver_brute.py --config config-dtn.json 
 ```

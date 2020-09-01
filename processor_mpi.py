@@ -17,8 +17,6 @@ srun -n 4 python -m mpi4py.futures processor_mpi.py  --config configs/test_cross
 import os
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor, MPICommExecutor
-import sys
-sys.path.append("/global/homes/r/rkube/software/adios2-current/lib64/python3.7/site-packages")
 
 import logging
 import logging.config
@@ -40,20 +38,77 @@ import adios2
 
 import backends
 
-from readers.reader_mpi import reader_bpfile
+from streaming.reader_mpi import reader_gen
+
 from analysis.task_fft import task_fft_scipy
 from analysis.tasks_mpi import task_spectral
+from analysis.channels import channel_range
 
 
 @attr.s 
 class AdiosMessage:
-    """Storage class used to transfer data from Kstar(Dataman) to
-    local PoolExecutor"""
+    """Storage class used to transfer data from Kstar(Dataman) to local PoolExecutor"""
     tstep_idx = attr.ib(repr=True)
-    data       = attr.ib(repr=False)
-
+    data      = attr.ib(repr=False)
 
 cfg = {}
+
+
+# class ConsumeThread(threading.Thread):
+#     def __init__(self, Q, executor, task_list, cfg):
+#         """ constructor, setting initial variables """
+#         self.Q = Q
+#         self.executor = executor 
+#         self.task_list = task_list 
+#         self.logger = logging.getLogger("simple")
+
+#         self.logger.info("Constructing thread")
+
+#         self.cfg = cfg
+#         self.cfg["fft_params"]["fsample"] = self.cfg["ECEI_cfg"]["SampleRate"] * 1e3
+#         self.my_fft = task_fft_scipy(10_000, self.cfg["fft_params"], normalize=True, detrend=True)
+
+#         self._interrupt = threading.Event()
+#         threading.Thread.__init__(self)
+        
+
+#     def interrupt(self):
+#         self._interrupt.set()
+        
+#     def run(self):
+#         #logger = logging.getLogger('simple')
+#         global cfg
+
+#         #comm  = MPI.COMM_WORLD
+#         #rank = comm.Get_rank()
+#         #size = comm.Get_size()
+
+#         # Create the FFT task
+#         self.logger.info("Starting thread")
+
+#         while True:
+#             try:
+#                 msg = Q.get(timeout=5.0)
+#             except queue.Empty:
+#                 self.logger.info("Queue is empty. Exiting")
+#                 break
+
+#             # If we get our special break message, we exit
+#             if msg.tstep_idx == None:
+#                 Q.task_done()
+#                 break
+
+#             # Step 1) Perform STFT. TODO: We may distribute this among the tasks
+#             tic_fft = timeit.default_timer()
+#             fft_data = self.my_fft.do_fft_local(msg.data)
+#             toc_fft = timeit.default_timer()
+#             logger.info(f"tidx={msg.tstep_idx}: FFT took {(toc_fft - tic_fft):6.4f}s")
+
+#             # Step 2) Distribute tasks to the executor 
+#             for task in self.task_list:
+#                 task.submit(self.executor, fft_data, msg.tstep_idx, self.cfg)
+
+#             Q.task_done()
 
 
 def consume(Q, executor, my_fft, task_list):
@@ -63,26 +118,44 @@ def consume(Q, executor, my_fft, task_list):
     logger = logging.getLogger('simple')
     global cfg
 
+    comm  = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    # # Create the FFT task
+    # cfg["fft_params"]["fsample"] = cfg["ECEI_cfg"]["SampleRate"] * 1e3
+    # my_fft = task_fft_scipy(10_000, cfg["fft_params"], normalize=True, detrend=True)
+    # fft_params = my_fft.get_fft_params()
+
+    logger.info("Starting consume")
+
     while True:
-        msg = Q.get()
+        try:
+            msg = Q.get(timeout=2.0)
+        except queue.Empty:
+            logger.info("Empty queue after waiting until time-out. Exiting")
+            break
         # If we get our special break message, we exit
         if msg.tstep_idx == None:
             Q.task_done()
             break
 
         # Step 1) Perform STFT. TODO: We may distribute this among the tasks
-        tic_fft = timeit.default_timer()
-        fft_data = my_fft.do_fft_local(msg.data)
-        toc_fft = timeit.default_timer()
-        logger.info(f"tidx={msg.tstep_idx}: FFT took {(toc_fft - tic_fft):6.4f}s")
+        # tic_fft = timeit.default_timer()
+        # fft_data = my_fft.do_fft_local(msg.data)
+        # toc_fft = timeit.default_timer()
+        logger.info(f"rank {rank}: tidx={msg.tstep_idx}")
 
-        # Step 2) Distribute the work via the executor 
+        #np.savez(f"test_data/fft_array_s{msg.tstep_idx:04d}.npz", fft_data=fft_data)
+        #logger.info("STORING FFT DATA")
+
+        # Step 2) Distribute tasks to the executor 
         for task in task_list:
             #task.calc_and_store(executor, fft_data, msg.tstep_idx, cfg)
-            task.submit(executor, fft_data, msg.tstep_idx, cfg)
+            task.submit(executor, msg.data, msg.tstep_idx)
 
         Q.task_done()
-        logger.info(f"Consumed {msg}")
+    logger.info("Task done")
 
 
 def main():
@@ -100,40 +173,26 @@ def main():
     
     # Load logger configuration from file: 
     # http://zetcode.com/python/logging/
-    with open('configs/logger.yaml', 'r') as f:
+    with open("configs/logger.yaml", "r") as f:  
         log_cfg = yaml.safe_load(f.read())
     logging.config.dictConfig(log_cfg)
 
-
-    # # Create a sub-directory in tests_performance if we run in benchmark mode
-    # if args.benchmark:
-    #     logger = logging.getLogger('benchmark')
-    #     logger.info("Running in benchmark mode")
-
-    #     tmpdir_name = os.path.join("tests_performance", cfg['run_id'])
-    #     logger.info(f"Runing in benchmark mode. Logging in {tmpdir_name}/performance.log")
-    #     os.mkdir(tmpdir_name)
-        
-    #     # Create the file handler
-    #     benchmark_fh = logging.FileHandler(os.path.join(tmpdir_name, 'performance.log'))
-    #     benchmark_formatter = logging.Formatter("%(levelname)s %(asctime)s,%(msecs)d [Process %(process)d %(processName)s %(threadName)s] [%(module)s %(funcName)s]: %(message)s ")
-    #     benchmark_fh.setFormatter(benchmark_formatter)
-
-    #     logger.addHandler(benchmark_fh)
-
-    # else:
-    #     logger = logging.getLogger('simple')
-
+    comm  = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
 
     # Create a global executor
     #executor = concurrent.futures.ThreadPoolExecutor(max_workers=60)
     #executor = MPIPoolExecutor(max_workers=24)
+    adios2_varname = channel_range.from_str(cfg["transport"]["channel_range"][0])
 
     with MPICommExecutor(MPI.COMM_WORLD) as executor:
         if executor is not None:
 
-            logger = logging.getLogger("simple")
-            cfg['run_id'] = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+            logger = logging.getLogger('simple')
+            cfg["run_id"] = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+            cfg["run_id"] = "ABC125"
+            cfg["storage"]["run_id"] = cfg["run_id"]
             logger.info(f"Starting run {cfg['run_id']}")
     
             # Instantiate a storage backend and store the run configuration and task configuration
@@ -144,7 +203,9 @@ def main():
             elif cfg['storage']['backend'] == "null":
                 store_backend = backends.backend_null(cfg['storage'])
 
+            logger.info("Storing one")
             store_backend.store_one({"run_id": cfg['run_id'], "run_config": cfg})
+            logger.info("Done storing. Continuing:")
 
             # Create the FFT task
             cfg["fft_params"]["fsample"] = cfg["ECEI_cfg"]["SampleRate"] * 1e3
@@ -152,59 +213,78 @@ def main():
             fft_params = my_fft.get_fft_params()
 
             # Create ADIOS reader object
-            reader = reader_bpfile(cfg["shotnr"], cfg["ECEI_cfg"])
-            reader.Open(cfg["datapath"])
+            reader = reader_gen(cfg["transport"])
 
-            # Create the task list
-            task_list = []
-            for task_config in cfg["task_list"]:
-                #task_list.append(task_object_dict[task_config["analysis"]](task_config, fft_params, cfg["ECEI_cfg"]))
-                task_list.append(task_spectral(task_config, fft_params, cfg["ECEI_cfg"]))
-                store_backend.store_metadata(task_config, task_list[-1].get_dispatch_sequence())
+            # Create a list of individual spectral tasks
+            #task_list = []
+            #for task_config in cfg["task_list"]:
+            #    #task_list.append(task_spectral(task_config, fft_params, cfg["ECEI_cfg"]))
+            #    #task_list.append(task_spectral(task_config, cfg["fft_params"], cfg["ECEI_cfg"], cfg["storage"]))
+            #    #store_backend.store_metadata(task_config, task_list[-1].get_dispatch_sequence())
                 
             dq = queue.Queue()
             msg = None
 
             tic_main = timeit.default_timer()
+            workers = []
+            for _ in range(16):
+                #thr = ConsumeThread(dq, executor, task_list, cfg)
+                worker = threading.Thread(target=consume, args=(dq, executor, my_fft, task_list))
+                worker.start()
+                workers.append(worker)
+            #    logger.info(f"Started thread {thr}")
 
-            worker = threading.Thread(target=consume, args=(dq, executor, my_fft, task_list))
-            worker.start()
-
+            # reader.Open() is blocking until it opens the data file or receives the
+            # data stream. Put this right before entering the main loop
+            logger.info(f"{rank} Waiting for generator")
+            reader.Open()
+            last_step = 0
             logger.info(f"Starting main loop")
+
+            rx_list = []
             while True:
                 stepStatus = reader.BeginStep()
-
+                logger.info(f"currentStep = {reader.CurrentStep()}")
                 if stepStatus:
                     # Read data
-                    stream_data = reader.Get(save=True)
+                    stream_data = reader.Get(adios2_varname, save=False)
+                    rx_list.append(reader.CurrentStep())
 
                     # Generate message id and publish is
                     msg = AdiosMessage(tstep_idx=reader.CurrentStep(), data=stream_data)
-                    dq.put(msg)
+                    dq.put_nowait(msg)
                     logger.info(f"Published message {msg}")
-
-                if reader.CurrentStep() >= 100:
+                    reader.EndStep()
+                else:
                     logger.info(f"Exiting: StepStatus={stepStatus}")
+                    break
+
+                #Early stopping for debug
+                if reader.CurrentStep() > 100:
+                    logger.info(f"Exiting: CurrentStep={reader.CurrentStep()}, StepStatus={stepStatus}")
                     dq.put(AdiosMessage(tstep_idx=None, data=None))
                     break
 
-            logger.info("Exiting main loop")
-            worker.join()
-            logger.info("Workers have joined")
+                last_step = reader.CurrentStep()
+
             dq.join()
             logger.info("Queue joined")
+
+            logger.info("Exiting main loop")
+            for thr in workers:
+                thr.join()
+
+            logger.info("Workers have joined")
 
             # Shotdown the executioner
             executor.shutdown(wait=True)
 
             toc_main = timeit.default_timer()
             logger.info(f"Run {cfg['run_id']} finished in {(toc_main - tic_main):6.4f}s")
-
-
+            logger.info(f"Processed time_chunks {rx_list}")
     # End MPICommExecutor section
 
 if __name__ == "__main__":
     main()
 
-
-# End of file processor_dask_mp.yp
+# End of file processor_mpi.py

@@ -107,7 +107,7 @@ class channel():
         ch_v: int, Vertical channel number, between 1 and 8
         """
 
-        assert(dev in ['L', 'H', 'G', 'HT', 'GR', 'HR'])
+        assert(dev in ['L', 'H', 'G', "GT", 'HT', 'GR', 'HR'])
         # 24 horizontal channels
         assert((ch_v > 0) & (ch_v  < 25))
         # 8 vertical channels
@@ -251,8 +251,6 @@ class channel_range:
     The iteration proceeds linear from the index of a start_channel to the index of an end_channel:
     >>> ch_start = channel('L', 1, 7)
     >>> ch_end = channel('L', 2,)
-    ... to be continued
-
 
     """
 
